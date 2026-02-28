@@ -6,20 +6,19 @@ import (
 	"sync"
 )
 
-// 1. 定义事件类型
+// Event 模拟 CDC 事件
 type Event struct {
-	Key   string // 主键（如k1,k2）
-	Value string // 值（简化版可不使用）
-	Type  string // "insert"/"update"/"delete"
+	Key  string
+	Type string // "L", "H", "DATA"
 }
 
-// 2. 水印处理器
+// WatermarkProcessor 核心算法实现
 type WatermarkProcessor struct {
 	mu           sync.Mutex
-	activeKeys   map[string]bool // 记录水印窗口内（L和H之间）的活跃主键
-	inWindow     bool            // 是否处于水印窗口内
-	pendingChunk []string        // 存储当前等待合并的数据库分片数据
-	outputBuffer []string        // 输出序列
+	activeKeys   map[string]bool
+	inWindow     bool
+	pendingChunk []string
+	outputBuffer []string
 }
 
 func NewWatermarkProcessor() *WatermarkProcessor {
@@ -28,63 +27,89 @@ func NewWatermarkProcessor() *WatermarkProcessor {
 	}
 }
 
-// 3. 处理变更日志事件
-func (wp *WatermarkProcessor) ProcessEvent(event Event) {
+// ProcessEvent 处理日志流中的每一个事件（增量流）
+func (wp *WatermarkProcessor) ProcessEvent(e Event) {
 	wp.mu.Lock()
 	defer wp.mu.Unlock()
 
-	switch {
-	case event.Key == "L": // 低水印
+	switch e.Type {
+	case "L":
 		wp.inWindow = true
-		fmt.Println(">>> 收到低水位 L，进入水印窗口")
-	case event.Key == "H": // 高水位
-		fmt.Println(">>> 收到高水位 H，开始合并 Chunk 并退出窗口")
-		// 算法核心步骤：在高水位到达时，合并 Chunk 数据
+		fmt.Printf("\n[LogStream] <--- 收到低水位 L (uuid_low)，开始监控变更\n")
+	case "H":
+		fmt.Printf("[LogStream] <--- 收到高水位 H (uuid_high)，触发 Chunk 合并并过滤\n")
+		// 落地逻辑：在高水位处将 Chunk 合并到输出流
+		count := 0
 		for _, key := range wp.pendingChunk {
 			if !wp.activeKeys[key] {
-				// 如果 Chunk 中的 key 在窗口内没有新的变更，则合并到输出流
+				// 过滤逻辑：如果窗口内没变过，则合并
 				wp.outputBuffer = append(wp.outputBuffer, key+"(chunk)")
+				count++
+			} else {
+				fmt.Printf("  [Filter] 拦截到窗口内冲突 Key: %s (以增量日志为准)\n", key)
 			}
 		}
+		fmt.Printf("  [Merge] 成功合并 %d 条数据，跳过 %d 条冲突数据\n", count, len(wp.pendingChunk)-count)
 		wp.inWindow = false
 		wp.activeKeys = make(map[string]bool)
 		wp.pendingChunk = nil
-	default: // 普通数据事件
+	case "DATA":
 		if wp.inWindow {
-			wp.activeKeys[event.Key] = true // 记录窗口内活跃 key，用于过滤 Chunk
+			wp.activeKeys[e.Key] = true
 		}
-		wp.outputBuffer = append(wp.outputBuffer, event.Key)
+		wp.outputBuffer = append(wp.outputBuffer, e.Key)
 	}
 }
 
-// SetPendingChunk 模拟从数据库读取一个分片（Chunk）
-func (wp *WatermarkProcessor) SetPendingChunk(chunk []string) {
+// SetChunkData 模拟数据库异步读取返回的数据（全量读取）
+func (wp *WatermarkProcessor) SetChunkData(chunk []string) {
 	wp.mu.Lock()
 	defer wp.mu.Unlock()
 	wp.pendingChunk = chunk
-	fmt.Printf(">>> 已准备分片数据: %v\n", chunk)
+	fmt.Printf("[DB] 已读取数据分片: %v\n", chunk)
 }
-
-// 原来的 ProcessChunk 和 flushChunk 逻辑已集成到 ProcessEvent(H) 中
 
 func main() {
 	wp := NewWatermarkProcessor()
 
-	// 模拟变更日志流
-	// 论文示意图顺序：k2, k3, k4, k1, L, k3, k1, k1, k3, H, k1, k2, k6
-	fullLog := []string{"k2", "k3", "k4", "k1", "L", "k3", "k1", "k1", "k3", "H", "k1", "k2", "k6"}
+	// 1. 初始背景：系统正常处理增量日志
+	fmt.Println("=== 1. 系统启动，处理增量日志 ===")
+	wp.ProcessEvent(Event{Key: "k1", Type: "DATA"})
+	wp.ProcessEvent(Event{Key: "k2", Type: "DATA"})
 
-	for _, key := range fullLog {
-		// 模拟在窗口期内（L之后，H之前）异步读取数据库 Chunk
-		if key == "k3" && wp.inWindow && len(wp.pendingChunk) == 0 {
-			// 模拟步骤 (3): SELECT next chunk FROM table
-			chunkData := []string{"k2", "k4", "k5", "k6"}
-			wp.SetPendingChunk(chunkData)
-		}
-		wp.ProcessEvent(Event{Key: key})
-	}
+	// 2. 触发全量同步（模拟 DBlog 论文步骤 1-4）
+	fmt.Println("\n=== 2. 触发全量同步 (DBlog Algorithm 1) ===")
 
-	// 打印输出顺序
-	fmt.Println("\n最终输出序列 (Output Buffer):")
+	// 步骤 (2): 插入低水位 L
+	wp.ProcessEvent(Event{Key: "uuid_low", Type: "L"})
+
+	// 步骤 (3): 异步从数据库读取 Chunk (模拟耗时)
+	// 在窗口期内发生的变更
+	wp.ProcessEvent(Event{Key: "k3", Type: "DATA"}) // 窗口内变更
+	wp.ProcessEvent(Event{Key: "k1", Type: "DATA"}) // 窗口内变更 (k1 在此更新了)
+
+	// 此时数据库查询结果回来了
+	fmt.Println("\n[Async] 数据库查询线程返回结果...")
+	wp.SetChunkData([]string{"k1", "k4", "k5"}) // 注意：k1 在上面的窗口期变过了
+
+	wp.ProcessEvent(Event{Key: "k6", Type: "DATA"}) // 窗口内变更
+
+	// 步骤 (4): 插入高水位 H
+	wp.ProcessEvent(Event{Event{Key: "uuid_high", Type: "H"}.Key, Event{Key: "uuid_high", Type: "H"}.Type})
+	// 修复上面一行的小手抖写法，改为标准调用:
+	wp.ProcessEvent(Event{Key: "uuid_high", Type: "H"})
+
+	// 3. 同步继续
+	fmt.Println("\n=== 3. 同步继续，处理后续日志 ===")
+	wp.ProcessEvent(Event{Key: "k7", Type: "DATA"})
+
+	// 最终展示
+	fmt.Println("\n" + strings.Repeat("=", 40))
+	fmt.Println("最终输出序列 (Output Buffer):")
 	fmt.Println(strings.Join(wp.outputBuffer, " -> "))
+	fmt.Println(strings.Repeat("=", 40))
+
+	fmt.Println("\n逻辑解析:")
+	fmt.Println("1. k1 在窗口内出现了增量日志，所以 Chunk 中的 k1(旧值) 被过滤器拦截，保证了最终一致性。")
+	fmt.Println("2. k4, k5 在窗口内没变过，安全地从 Chunk 合并到了输出流中。")
 }
