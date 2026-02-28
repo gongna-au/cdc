@@ -47,12 +47,3 @@ k2 -> k3 -> k4 -> k1 -> L -> k3 -> k1 -> k1 -> k3 -> H -> k2(chunk) -> k4(chunk)
 - `Event`: 模拟 CDC 时间结构。
 - `WatermarkProcessor`: 核心处理器，维护 `activeKeys`（活跃主键集合）和 `outputBuffer`（最终输出序列）。
 
-## 仓库初始化指南
-
-如果您打算将此目录管理为 Git 仓库，请按照以下步骤操作：
-
-```bash
-git init
-git add .
-git commit -m "Initial commit: DBlog watermark algorithm simulation"
-```
